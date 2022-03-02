@@ -2,7 +2,6 @@
 #define _SDE_DRM_H_
 
 #include "drm.h"
-#include <linux/userland.h>
 
 /* Total number of supported color planes */
 #define SDE_MAX_PLANES  4

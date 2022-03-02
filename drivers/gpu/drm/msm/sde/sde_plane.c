@@ -20,6 +20,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
+#include <linux/userland.h>
 #include <uapi/drm/sde_drm.h>
 #include <uapi/drm/msm_drm_pp.h>
 
