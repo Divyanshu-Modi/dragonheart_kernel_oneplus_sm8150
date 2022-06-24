@@ -632,7 +632,7 @@ static int f2fs_set_zstd_level(struct f2fs_sb_info *sbi, const char *str)
 	if (kstrtouint(str + 1, 10, &level))
 		return -EINVAL;
 
-	if (!level || level > zstd_max_clevel()) {
+	if (!level || level > ZSTD_maxCLevel()) {
 		f2fs_info(sbi, "invalid zstd compress level: %d", level);
 		return -EINVAL;
 	}
@@ -996,21 +996,7 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 			kfree(name);
 			break;
 		case Opt_fsync:
-			name = match_strdup(&args[0]);
-			if (!name)
-				return -ENOMEM;
-			if (!strcmp(name, "posix")) {
-				F2FS_OPTION(sbi).fsync_mode = FSYNC_MODE_POSIX;
-			} else if (!strcmp(name, "strict")) {
-				F2FS_OPTION(sbi).fsync_mode = FSYNC_MODE_STRICT;
-			} else if (!strcmp(name, "nobarrier")) {
-				F2FS_OPTION(sbi).fsync_mode =
-							FSYNC_MODE_NOBARRIER;
-			} else {
-				kfree(name);
-				return -EINVAL;
-			}
-			kfree(name);
+			f2fs_info(sbi, "changing fsync mode not supported");
 			break;
 		case Opt_test_dummy_encryption:
 			ret = f2fs_set_test_dummy_encryption(sb, p, &args[0],
@@ -1334,6 +1320,9 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	spin_lock_init(&fi->i_size_lock);
 	INIT_LIST_HEAD(&fi->dirty_list);
 	INIT_LIST_HEAD(&fi->gdirty_list);
+	INIT_LIST_HEAD(&fi->inmem_ilist);
+	INIT_LIST_HEAD(&fi->inmem_pages);
+	mutex_init(&fi->inmem_lock);
 	init_f2fs_rwsem(&fi->i_gc_rwsem[READ]);
 	init_f2fs_rwsem(&fi->i_gc_rwsem[WRITE]);
 	init_f2fs_rwsem(&fi->i_mmap_sem);
@@ -1377,8 +1366,9 @@ static int f2fs_drop_inode(struct inode *inode)
 			atomic_inc(&inode->i_count);
 			spin_unlock(&inode->i_lock);
 
+			/* some remained atomic pages should discarded */
 			if (f2fs_is_atomic_file(inode))
-				f2fs_abort_atomic_write(inode, true);
+				f2fs_drop_inmem_pages(inode);
 
 			/* should remain fi->extent_tree for writepage */
 			f2fs_destroy_extent_node(inode);
@@ -1771,7 +1761,8 @@ static int f2fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	}
 
 	buf->f_namelen = F2FS_NAME_LEN;
-	buf->f_fsid    = u64_to_fsid(id);
+	buf->f_fsid.val[0] = (u32)id;
+	buf->f_fsid.val[1] = (u32)(id >> 32);
 
 #ifdef CONFIG_QUOTA
 	if (is_inode_flag_set(dentry->d_inode, FI_PROJ_INHERIT) &&
@@ -2106,15 +2097,8 @@ static int f2fs_disable_checkpoint(struct f2fs_sb_info *sbi)
 	sbi->gc_mode = GC_URGENT_HIGH;
 
 	while (!f2fs_time_over(sbi, DISABLE_TIME)) {
-		struct f2fs_gc_control gc_control = {
-			.victim_segno = NULL_SEGNO,
-			.init_gc_type = FG_GC,
-			.should_migrate_blocks = false,
-			.err_gc_skipped = true,
-			.nr_free_secs = 1 };
-
 		f2fs_down_write(&sbi->gc_lock);
-		err = f2fs_gc(sbi, &gc_control);
+		err = f2fs_gc(sbi, true, false, false, NULL_SEGNO);
 		if (err == -ENODATA) {
 			err = 0;
 			break;
@@ -2681,33 +2665,6 @@ static int f2fs_enable_quotas(struct super_block *sb)
 	return 0;
 }
 
-static int f2fs_quota_sync_file(struct f2fs_sb_info *sbi, int type)
-{
-	struct quota_info *dqopt = sb_dqopt(sbi->sb);
-	struct address_space *mapping = dqopt->files[type]->i_mapping;
-	int ret = 0;
-
-	ret = dquot_writeback_dquots(sbi->sb, type);
-	if (ret)
-		goto out;
-
-	ret = filemap_fdatawrite(mapping);
-	if (ret)
-		goto out;
-
-	/* if we are using journalled quota */
-	if (is_journalled_quota(sbi))
-		goto out;
-
-	ret = filemap_fdatawait(mapping);
-
-	truncate_inode_pages(&dqopt->files[type]->i_data, 0);
-out:
-	if (ret)
-		set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
-	return ret;
-}
-
 int f2fs_quota_sync(struct super_block *sb, int type)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
@@ -2716,51 +2673,56 @@ int f2fs_quota_sync(struct super_block *sb, int type)
 	int ret = 0;
 
 	/*
+	 * do_quotactl
+	 *  f2fs_quota_sync
+	 *  f2fs_down_read(quota_sem)
+	 *  dquot_writeback_dquots()
+	 *  f2fs_dquot_commit
+	 *                            block_operation
+	 *                            f2fs_down_read(quota_sem)
+	 */
+	f2fs_lock_op(sbi);
+
+	f2fs_down_read(&sbi->quota_sem);
+	ret = dquot_writeback_dquots(sb, type);
+	if (ret)
+		goto out;
+
+	/*
 	 * Now when everything is written we can discard the pagecache so
 	 * that userspace sees the changes.
 	 */
 	for (cnt = 0; cnt < MAXQUOTAS; cnt++) {
+		struct address_space *mapping;
 
 		if (type != -1 && cnt != type)
 			continue;
-
 		if (!sb_has_quota_active(sb, cnt))
 			continue;
 
-		if (!f2fs_sb_has_quota_ino(sbi))
-			inode_lock(dqopt->files[cnt]);
+		mapping = dqopt->files[cnt]->i_mapping;
 
-		/*
-		 * do_quotactl
-		 *  f2fs_quota_sync
-		 *  f2fs_down_read(quota_sem)
-		 *  dquot_writeback_dquots()
-		 *  f2fs_dquot_commit
-		 *			      block_operation
-		 *			      f2fs_down_read(quota_sem)
-		 *
-		 * However, we cannot use the cp_rwsem to prevent this
-		 * deadlock, as the cp_rwsem is taken for read inside the
-		 * f2fs_dquot_commit code, and rwsem is not recursive.
-		 *
-		 * We therefore use a special lock to synchronize
-		 * f2fs_quota_sync with block_operations, as this is the only
-		 * place where such recursion occurs.
-		 */
-		f2fs_down_read(&sbi->cp_quota_rwsem);
-		f2fs_down_read(&sbi->quota_sem);
-
-		ret = f2fs_quota_sync_file(sbi, cnt);
-
-		f2fs_up_read(&sbi->quota_sem);
-		f2fs_up_read(&sbi->cp_quota_rwsem);
-
-		if (!f2fs_sb_has_quota_ino(sbi))
-			inode_unlock(dqopt->files[cnt]);
-
+		ret = filemap_fdatawrite(mapping);
 		if (ret)
-			break;
+			goto out;
+
+		/* if we are using journalled quota */
+		if (is_journalled_quota(sbi))
+			continue;
+
+		ret = filemap_fdatawait(mapping);
+		if (ret)
+			set_sbi_flag(F2FS_SB(sb), SBI_QUOTA_NEED_REPAIR);
+
+		inode_lock(dqopt->files[cnt]);
+		truncate_inode_pages(&dqopt->files[cnt]->i_data, 0);
+		inode_unlock(dqopt->files[cnt]);
 	}
+out:
+	if (ret)
+		set_sbi_flag(F2FS_SB(sb), SBI_QUOTA_NEED_REPAIR);
+	f2fs_up_read(&sbi->quota_sem);
+	f2fs_unlock_op(sbi);
 	return ret;
 }
 
@@ -4123,7 +4085,6 @@ try_onemore:
 
 	init_f2fs_rwsem(&sbi->cp_rwsem);
 	init_f2fs_rwsem(&sbi->quota_sem);
-	init_f2fs_rwsem(&sbi->cp_quota_rwsem);
 	init_waitqueue_head(&sbi->cp_wait);
 	init_sb_info(sbi);
 

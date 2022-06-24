@@ -15,7 +15,6 @@
 #include <linux/freezer.h>
 #include <linux/sched/signal.h>
 #include <linux/random.h>
-#include <uapi/linux/sched/types.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -36,10 +35,6 @@ static int gc_thread_func(void *data)
 	wait_queue_head_t *wq = &sbi->gc_thread->gc_wait_queue_head;
 	wait_queue_head_t *fggc_wq = &sbi->gc_thread->fggc_wq;
 	unsigned int wait_ms;
-	struct f2fs_gc_control gc_control = {
-		.victim_segno = NULL_SEGNO,
-		.should_migrate_blocks = false,
-		.err_gc_skipped = false };
 
 	wait_ms = gc_th->min_sleep_time;
 
@@ -146,12 +141,8 @@ do_gc:
 		if (foreground)
 			sync_mode = false;
 
-		gc_control.init_gc_type = sync_mode ? FG_GC : BG_GC;
-		gc_control.no_bg_gc = foreground;
-		gc_control.nr_free_secs = foreground ? 1 : 0;
-
 		/* if return value is not zero, no victim was selected */
-		if (f2fs_gc(sbi, &gc_control))
+		if (f2fs_gc(sbi, sync_mode, !foreground, false, NULL_SEGNO))
 			wait_ms = gc_th->no_gc_sleep_time;
 
 		if (foreground)
@@ -171,7 +162,6 @@ next:
 
 int f2fs_start_gc_thread(struct f2fs_sb_info *sbi)
 {
-	const struct sched_param param = { .sched_priority = 0 };
 	struct f2fs_gc_kthread *gc_th;
 	dev_t dev = sbi->sb->s_bdev->bd_dev;
 	int err = 0;
@@ -199,9 +189,6 @@ int f2fs_start_gc_thread(struct f2fs_sb_info *sbi)
 		kfree(gc_th);
 		sbi->gc_thread = NULL;
 	}
-	sched_setscheduler(sbi->gc_thread->f2fs_gc_task, SCHED_IDLE, &param);
-	set_task_ioprio(sbi->gc_thread->f2fs_gc_task,
-			IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
 out:
 	return err;
 }
@@ -980,8 +967,8 @@ static int gc_node_segment(struct f2fs_sb_info *sbi,
 	int off;
 	int phase = 0;
 	int submitted = 0;
-	bool fggc = (gc_type == FG_GC);
 	unsigned int usable_blks_in_seg = f2fs_usable_blks_in_seg(sbi, segno);
+	bool fggc = (gc_type == FG_GC);
 
 	start_addr = START_BLOCK(sbi, segno);
 
@@ -1258,6 +1245,17 @@ static int move_data_block(struct inode *inode, block_t bidx,
 		goto out;
 	}
 
+	if (f2fs_is_atomic_file(inode)) {
+		err = -EAGAIN;
+		F2FS_I(inode)->i_gc_failures[GC_FAILURE_ATOMIC]++;
+		F2FS_I_SB(inode)->skipped_atomic_files[gc_type]++;
+		goto out;
+	}
+
+	err = f2fs_gc_pinned_control(inode, gc_type, segno);
+	if (err)
+		goto out;
+
 	set_new_dnode(&dn, inode, NULL, NULL, 0);
 	err = f2fs_get_dnode_of_data(&dn, bidx, LOOKUP_NODE);
 	if (err)
@@ -1394,6 +1392,16 @@ static int move_data_page(struct inode *inode, block_t bidx, int gc_type,
 		err = -ENOENT;
 		goto out;
 	}
+
+	if (f2fs_is_atomic_file(inode)) {
+		err = -EAGAIN;
+		F2FS_I(inode)->i_gc_failures[GC_FAILURE_ATOMIC]++;
+		F2FS_I_SB(inode)->skipped_atomic_files[gc_type]++;
+		goto out;
+	}
+	err = f2fs_gc_pinned_control(inode, gc_type, segno);
+	if (err)
+		goto out;
 
 	if (gc_type == BG_GC) {
 		if (PageWriteback(page)) {
@@ -1746,31 +1754,25 @@ skip:
 	return seg_freed;
 }
 
-int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
+int f2fs_gc(struct f2fs_sb_info *sbi, bool sync,
+			bool background, bool force, unsigned int segno)
 {
-	int gc_type = gc_control->init_gc_type;
-	unsigned int segno = gc_control->victim_segno;
+	int gc_type = sync ? FG_GC : BG_GC;
 	int sec_freed = 0, seg_freed = 0, total_freed = 0;
 	int ret = 0;
 	struct cp_control cpc;
+	unsigned int init_segno = segno;
 	struct gc_inode_list gc_list = {
 		.ilist = LIST_HEAD_INIT(gc_list.ilist),
 		.iroot = RADIX_TREE_INIT(gc_list.iroot, GFP_NOFS),
 	};
+	unsigned long long last_skipped = sbi->skipped_atomic_files[FG_GC];
+	unsigned long long first_skipped;
 	unsigned int skipped_round = 0, round = 0;
-
-	trace_f2fs_gc_begin(sbi->sb, gc_type, gc_control->no_bg_gc,
-				gc_control->nr_free_secs,
-				get_pages(sbi, F2FS_DIRTY_NODES),
-				get_pages(sbi, F2FS_DIRTY_DENTS),
-				get_pages(sbi, F2FS_DIRTY_IMETA),
-				free_sections(sbi),
-				free_segments(sbi),
-				reserved_segments(sbi),
-				prefree_segments(sbi));
 
 	cpc.reason = __get_cp_reason(sbi);
 	sbi->skipped_gc_rwsem = 0;
+	first_skipped = last_skipped;
 gc_more:
 	if (unlikely(!(sbi->sb->s_flags & MS_ACTIVE))) {
 		ret = -EINVAL;
@@ -1787,7 +1789,8 @@ gc_more:
 		 * threshold, we can make them free by checkpoint. Then, we
 		 * secure free segments which doesn't need fggc any more.
 		 */
-		if (prefree_segments(sbi)) {
+		if (prefree_segments(sbi) &&
+				!is_sbi_flag_set(sbi, SBI_CP_DISABLED)) {
 			ret = f2fs_write_checkpoint(sbi, &cpc);
 			if (ret)
 				goto stop;
@@ -1797,7 +1800,7 @@ gc_more:
 	}
 
 	/* f2fs_balance_fs doesn't need to do BG_GC in critical path. */
-	if (gc_type == BG_GC && gc_control->no_bg_gc) {
+	if (gc_type == BG_GC && !background) {
 		ret = -EINVAL;
 		goto stop;
 	}
@@ -1813,50 +1816,54 @@ retry:
 		goto stop;
 	}
 
-	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type,
-				gc_control->should_migrate_blocks);
+	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type, force);
+	if (gc_type == FG_GC &&
+		seg_freed == f2fs_usable_segs_in_sec(sbi, segno))
+		sec_freed++;
 	total_freed += seg_freed;
 
-	if (seg_freed == f2fs_usable_segs_in_sec(sbi, segno))
-		sec_freed++;
+	if (gc_type == FG_GC) {
+		if (sbi->skipped_atomic_files[FG_GC] > last_skipped ||
+						sbi->skipped_gc_rwsem)
+			skipped_round++;
+		last_skipped = sbi->skipped_atomic_files[FG_GC];
+		round++;
+	}
 
 	if (gc_type == FG_GC)
 		sbi->cur_victim_sec = NULL_SEGNO;
 
-	if (gc_control->init_gc_type == FG_GC ||
-	    !has_not_enough_free_secs(sbi,
-				(gc_type == FG_GC) ? sec_freed : 0, 0)) {
-		if (gc_type == FG_GC && sec_freed < gc_control->nr_free_secs)
-			goto go_gc_more;
+	if (sync)
 		goto stop;
-	}
 
-	/* FG_GC stops GC by skip_count */
-	if (gc_type == FG_GC) {
-		if (sbi->skipped_gc_rwsem)
-			skipped_round++;
-		round++;
-		if (skipped_round > MAX_SKIP_GC_COUNT &&
-				skipped_round * 2 >= round) {
+	if (!has_not_enough_free_secs(sbi, sec_freed, 0))
+		goto stop;
+
+	if (skipped_round <= MAX_SKIP_GC_COUNT || skipped_round * 2 < round) {
+
+		/* Write checkpoint to reclaim prefree segments */
+		if (free_sections(sbi) < NR_CURSEG_PERSIST_TYPE &&
+				prefree_segments(sbi) &&
+				!is_sbi_flag_set(sbi, SBI_CP_DISABLED)) {
 			ret = f2fs_write_checkpoint(sbi, &cpc);
-			goto stop;
+			if (ret)
+				goto stop;
 		}
+		segno = NULL_SEGNO;
+		goto gc_more;
 	}
-
-	/* Write checkpoint to reclaim prefree segments */
-	if (free_sections(sbi) < NR_CURSEG_PERSIST_TYPE &&
-				prefree_segments(sbi)) {
+	if (first_skipped < last_skipped &&
+			(last_skipped - first_skipped) >
+					sbi->skipped_gc_rwsem) {
+		f2fs_drop_inmem_pages_all(sbi, true);
+		segno = NULL_SEGNO;
+		goto gc_more;
+	}
+	if (gc_type == FG_GC && !is_sbi_flag_set(sbi, SBI_CP_DISABLED))
 		ret = f2fs_write_checkpoint(sbi, &cpc);
-		if (ret)
-			goto stop;
-	}
-go_gc_more:
-	segno = NULL_SEGNO;
-	goto gc_more;
-
 stop:
 	SIT_I(sbi)->last_victim[ALLOC_NEXT] = 0;
-	SIT_I(sbi)->last_victim[FLUSH_DEVICE] = gc_control->victim_segno;
+	SIT_I(sbi)->last_victim[FLUSH_DEVICE] = init_segno;
 
 	if (gc_type == FG_GC)
 		f2fs_unpin_all_sections(sbi, true);
@@ -1874,7 +1881,7 @@ stop:
 
 	put_gc_inode(&gc_list);
 
-	if (gc_control->err_gc_skipped && !ret)
+	if (sync && !ret)
 		ret = sec_freed ? 0 : -EAGAIN;
 	return ret;
 }
